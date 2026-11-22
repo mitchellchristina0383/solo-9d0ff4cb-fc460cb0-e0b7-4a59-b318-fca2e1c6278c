@@ -28,7 +28,9 @@ def create_app(rules: RuleStore, forwarder: DNSForwarder) -> FastAPI:
             "matching; names without a suffix match use the default upstream. "
             "Changes take effect immediately: cache entries for names whose "
             "upstream changed are evicted and in-flight queries are "
-            "redispatched, without waiting for upstream answers."
+            "redispatched, without waiting for upstream answers. Positive A "
+            "answers are refreshed in the background once their remaining TTL "
+            "drops to 20% of the original; see /cache and /refreshes."
         ),
     )
 
@@ -87,23 +89,43 @@ def create_app(rules: RuleStore, forwarder: DNSForwarder) -> FastAPI:
     async def list_cache(request: Request) -> list[CacheEntryView]:
         _, fwd = _state(request)
         now = time.monotonic()
+        refresh_ids = {job.entry_id for job in fwd.refreshes.all()}
         return [
             CacheEntryView(
+                entry_id=e.entry_id,
                 qname=e.qname,
                 qtype=QTYPE[e.qtype],
                 upstream=e.upstream,
                 rcode=RCODE_NAMES.get(e.rcode, str(e.rcode)),
                 ttl_remaining=round(max(0.0, e.expires_at - now), 3),
+                ttl_original=e.ttl,
                 expires_at=round(e.expires_at, 3),
+                refresh_scheduled=e.refresh_scheduled,
+                refresh_in_flight=e.entry_id in refresh_ids,
             )
             for e in fwd.cache.entries()
         ]
 
     @app.post("/cache/flush", response_model=dict, tags=["cache"],
-              summary="Flush the whole cache")
-    async def flush_cache(request: Request) -> dict[str, Any]:
+              summary="Flush the whole cache and cancel its background refreshes")
+    async def flush_cache(request: Request) -> dict:
         _, fwd = _state(request)
-        return {"flushed": fwd.cache.flush()}
+        return {"flushed": fwd.flush_cache()}
+
+    @app.get("/refreshes", tags=["inflight"],
+             summary="List background early-refresh jobs currently in flight")
+    async def list_refreshes(request: Request) -> list[dict[str, Any]]:
+        _, fwd = _state(request)
+        return [
+            {
+                "entry_id": job.entry_id,
+                "qname": job.qname,
+                "qtype": QTYPE[job.qtype],
+                "upstream": job.upstream,
+                "done": job.task.done(),
+            }
+            for job in fwd.refreshes.all()
+        ]
 
     @app.get("/inflight", tags=["inflight"],
              summary="List queries currently waiting on an upstream")
@@ -138,7 +160,13 @@ def create_app(rules: RuleStore, forwarder: DNSForwarder) -> FastAPI:
             stale_replies_discarded=s.stale_replies_discarded,
             servfail_responses=s.servfail_responses,
             upstream_timeouts=s.upstream_timeouts,
+            refreshes_triggered=s.refreshes_triggered,
+            refreshes_succeeded=s.refreshes_succeeded,
+            refreshes_failed=s.refreshes_failed,
+            refreshes_rejected=s.refreshes_rejected,
+            refreshes_cancelled=s.refreshes_cancelled,
             in_flight=len(fwd.inflight),
+            refreshes_in_flight=len(fwd.refreshes),
             cache_entries=len(fwd.cache),
             upstreams=dict(store.matcher().suffix_upstreams)
                        | {"(default)": store.matcher().default_upstream},

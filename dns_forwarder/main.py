@@ -38,11 +38,18 @@ async def amain() -> None:
     http_host = os.environ.get("HTTP_HOST", "0.0.0.0")
     http_port = int(os.environ.get("HTTP_PORT", "8080"))
     upstream_timeout = float(os.environ.get("UPSTREAM_TIMEOUT", "2.0"))
+    refresh_ttl_ratio = float(os.environ.get("REFRESH_TTL_RATIO", "0.2"))
+    if not 0.0 < refresh_ttl_ratio <= 1.0:
+        raise ValueError("REFRESH_TTL_RATIO must be within (0.0, 1.0]")
 
     initial = _load_initial_rules()
     rules = RuleStore(default_upstream=initial.default_upstream)
     rules.replace(initial)
-    forwarder = DNSForwarder(rules, upstream_timeout=upstream_timeout)
+    forwarder = DNSForwarder(
+        rules,
+        upstream_timeout=upstream_timeout,
+        refresh_ttl_ratio=refresh_ttl_ratio,
+    )
 
     loop = asyncio.get_running_loop()
     transport, _ = await loop.create_datagram_endpoint(

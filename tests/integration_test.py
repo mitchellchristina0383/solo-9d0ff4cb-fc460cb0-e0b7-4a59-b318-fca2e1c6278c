@@ -135,6 +135,29 @@ def min_answer_ttl(reply: DNSRecord) -> int:
     return min(ttls) if ttls else -1
 
 
+def cache_view() -> dict[str, dict]:
+    _, entries = http("GET", f"http://127.0.0.1:{HTTP_PORT}/cache")
+    return {e["qname"]: e for e in entries}
+
+
+def refreshes_view() -> list[dict]:
+    _, jobs = http("GET", f"http://127.0.0.1:{HTTP_PORT}/refreshes")
+    return jobs
+
+
+def put_record(port: int, qname: str, spec: dict) -> None:
+    http("PUT", f"http://127.0.0.1:{port}/records/{qname.rstrip('.')}", spec)
+
+
+def wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
 # ----------------------------------------------------------------- processes
 def start_processes() -> list[subprocess.Popen]:
     env = dict(os.environ)
@@ -168,6 +191,10 @@ def start_processes() -> list[subprocess.Popen]:
                        "DNS_LISTEN_PORT": str(DNS_PORT),
                        "HTTP_PORT": str(HTTP_PORT),
                        "UPSTREAM_TIMEOUT": str(UPSTREAM_TIMEOUT),
+                       # Production default is 0.2; the suite raises the
+                       # refresh window so early-refresh scenarios stay fast
+                       # and deterministic without forging tiny-TTL records.
+                       "REFRESH_TTL_RATIO": "0.8",
                        "DEFAULT_UPSTREAM": f"127.0.0.1:{A_DNS}",
                        "RULES_FILE": str(ROOT / "config/initial-rules-local.json")},
         stdout=open("/tmp/forwarder.log", "w"),
@@ -502,6 +529,268 @@ def test_interleaved_updates_and_queries() -> None:
           and upstream_counters(B_HTTP)["queries_received"] > 0)
 
 
+def test_early_refresh_concurrent_hits() -> None:
+    print("\n[T8a] early refresh: concurrent hits, one refresh, fresh TTL")
+    qname = "host1.lab.example.com."
+    rules_replace(f"127.0.0.1:{A_DNS}", [
+        {"suffix": "lab.example.com", "upstream": f"127.0.0.1:{A_DNS}"},
+    ])
+    http("POST", f"http://127.0.0.1:{HTTP_PORT}/cache/flush")
+    http("POST", f"http://127.0.0.1:{A_HTTP}/counters/reset")
+    # A short delay on A keeps the background refresh observable in /refreshes.
+    set_delay(A_HTTP, {qname: 0.8})
+    put_record(A_HTTP, qname, {"kind": "A", "ttl": 10, "addresses": ["10.10.0.11"]})
+
+    # Prime the cache (the priming foreground query waits out the 0.8s delay).
+    first = dns_query(qname, timeout=4)
+    check("priming query answered", first.header.rcode == RCODE.NOERROR)
+    entry_before = cache_view()[qname]
+    check("primed entry visible in /cache", entry_before["ttl_original"] == 10)
+    check("no refresh scheduled yet (full TTL)",
+          entry_before["refresh_scheduled"] is False)
+    upstream_before = upstream_counters(A_HTTP)["by_name"].get(qname, 0)
+
+    # Advance into the last 20% of the TTL window (the suite ratio is 0.8).
+    time.sleep(8.2)
+
+    # The first hit in the window schedules exactly one background refresh.
+    dns_query(qname)
+    view = cache_view().get(qname)
+    check("cache marks the entry as refresh-scheduled",
+          view is not None and view["refresh_scheduled"] is True, json.dumps(view))
+    check("one refresh job is visible via /refreshes",
+          wait_until(lambda: any(j["qname"] == qname for j in refreshes_view())),
+          json.dumps(refreshes_view()))
+
+    # While the refresh is pending, a burst of concurrent clients is answered
+    # immediately from the same cached entry, with no extra jobs or datagrams.
+    import threading
+    replies: list[DNSRecord] = []
+    errors: list[str] = []
+
+    def client() -> None:
+        try:
+            replies.append(dns_query(qname, timeout=3))
+        except OSError as exc:  # pragma: no cover - failure path
+            errors.append(str(exc))
+
+    threads = [threading.Thread(target=client) for _ in range(8)]
+    burst_start = time.monotonic()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+    burst_elapsed = time.monotonic() - burst_start
+
+    check("all concurrent clients got a reply",
+          len(replies) == 8 and not errors, f"replies={len(replies)} {errors}")
+    check("cached answers come back immediately (<200ms, no upstream wait)",
+          burst_elapsed < 0.2, f"elapsed={burst_elapsed:.3f}s")
+    check("every burst answer carries the cached address",
+          all(answer_addresses(r) == ["10.10.0.11"] for r in replies))
+    check("concurrent hits never schedule a second refresh job",
+          len([j for j in refreshes_view() if j["qname"] == qname]) == 1,
+          json.dumps(refreshes_view()))
+    check("no extra upstream datagram while the refresh is pending",
+          upstream_counters(A_HTTP)["by_name"].get(qname, 0)
+          == upstream_before + 1)
+
+    # The background refresh finishes and replaces the entry with a fresh
+    # full-TTL one (a new entry id); one extra upstream query served everyone.
+    replaced = wait_until(
+        lambda: (e := cache_view().get(qname)) is not None
+        and e["entry_id"] != entry_before["entry_id"]
+        and e["ttl_remaining"] > 8.0
+    )
+    check("refresh replaced the entry with a fresh full-TTL one", replaced,
+          json.dumps(cache_view().get(qname)))
+    upstream_after = upstream_counters(A_HTTP)["by_name"].get(qname, 0)
+    check("the whole burst triggered exactly one upstream refresh",
+          upstream_after == upstream_before + 1,
+          f"before={upstream_before} after={upstream_after}")
+    s = stats()
+    check("stats count one triggered and one succeeded refresh",
+          s["refreshes_triggered"] >= 1 and s["refreshes_succeeded"] >= 1,
+          json.dumps(s))
+
+    # Hits on the young replacement stay served from cache and do not refresh.
+    dns_query(qname)
+    dns_query(qname)
+    check("no further upstream queries while the fresh entry is young",
+          upstream_counters(A_HTTP)["by_name"].get(qname, 0) == upstream_after)
+    check("refresh list empties once the job finishes",
+          wait_until(lambda: all(j["qname"] != qname for j in refreshes_view())))
+    set_delay(A_HTTP, {qname: 0.0})
+
+
+def test_early_refresh_failure_keeps_expiry() -> None:
+    print("\n[T8b] early refresh failure keeps the original expiry, then normal re-query")
+    qname = "host2.lab.example.com."
+    rules_replace(f"127.0.0.1:{A_DNS}", [
+        {"suffix": "lab.example.com", "upstream": f"127.0.0.1:{A_DNS}"},
+    ])
+    http("POST", f"http://127.0.0.1:{HTTP_PORT}/cache/flush")
+    http("POST", f"http://127.0.0.1:{A_HTTP}/counters/reset")
+    # TTL 15 keeps the entry alive across the 1.5s refresh timeout below.
+    put_record(A_HTTP, qname, {"kind": "A", "ttl": 15, "addresses": ["10.10.0.12"]})
+
+    dns_query(qname)
+    entry_before = cache_view()[qname]
+    expiry_before = entry_before["expires_at"]
+
+    # Make the upstream silent for this name: the refresh must time out.
+    set_delay(A_HTTP, {qname: UPSTREAM_TIMEOUT + 3.0})
+    time.sleep(12.2)  # cross the 80% refresh mark (TTL 15 -> window at 3s left)
+    dns_query(qname)  # triggers the background refresh
+    check("refresh job appears",
+          wait_until(lambda: any(j["qname"] == qname for j in refreshes_view())))
+
+    failed = wait_until(
+        lambda: stats()["refreshes_failed"] >= 1,
+        timeout=UPSTREAM_TIMEOUT + 2.0,
+    )
+    check("refresh failure is counted", failed, json.dumps(stats()))
+    view = cache_view().get(qname)
+    check("original entry survives the failed refresh",
+          view is not None and view["entry_id"] == entry_before["entry_id"],
+          json.dumps(view))
+    check("original expiry is untouched after refresh failure",
+          view is not None and abs(view["expires_at"] - expiry_before) < 0.05,
+          f"before={expiry_before} after={view and view['expires_at']}")
+    check("failed refresh does not reschedule itself",
+          all(j["qname"] != qname for j in refreshes_view()))
+
+    # Once the entry really expires, a normal query goes back to the upstream.
+    # Restore a fast answer first so this foreground query succeeds.
+    set_delay(A_HTTP, {qname: 0.0})
+    time.sleep(2.0)
+    check("entry has expired out of the cache view", qname not in cache_view())
+    before = upstream_counters(A_HTTP)["by_name"].get(qname, 0)
+    reply = dns_query(qname)
+    after = upstream_counters(A_HTTP)["by_name"].get(qname, 0)
+    check("post-expiry query re-queries the upstream as usual",
+          reply.header.rcode == RCODE.NOERROR and after == before + 1,
+          f"before={before} after={after}")
+
+
+def test_early_refresh_flush_and_reroute() -> None:
+    print("\n[T8c] flush/reroute during a refresh: late result never written back")
+    rules_replace(f"127.0.0.1:{A_DNS}", [
+        {"suffix": "lab.example.com", "upstream": f"127.0.0.1:{A_DNS}"},
+    ])
+    http("POST", f"http://127.0.0.1:{HTTP_PORT}/cache/flush")
+    http("POST", f"http://127.0.0.1:{A_HTTP}/counters/reset")
+    http("POST", f"http://127.0.0.1:{B_HTTP}/counters/reset")
+
+    # --- phase 1: flush while a refresh is in flight ----------------------
+    flush_name = "flushcheck.lab.example.com."
+    put_record(A_HTTP, flush_name, {"kind": "A", "ttl": 10, "addresses": ["10.10.0.71"]})
+    set_delay(A_HTTP, {flush_name: 0.8})
+
+    dns_query(flush_name, timeout=4)
+    entry_before = cache_view()[flush_name]
+    time.sleep(8.2)  # enter the refresh window (ratio 0.8)
+    dns_query(flush_name)
+    check("[flush] refresh in flight before flush",
+          wait_until(lambda: any(j["qname"] == flush_name for j in refreshes_view())))
+
+    _, body = http("POST", f"http://127.0.0.1:{HTTP_PORT}/cache/flush")
+    check("[flush] flush reports the cleared entry",
+          body.get("flushed", 0) >= 1, json.dumps(body))
+    check("[flush] flush cancels the refresh job",
+          wait_until(lambda: all(j["qname"] != flush_name for j in refreshes_view())))
+
+    # Long enough for the (cancelled) upstream answer to have landed: the
+    # entry-id guard must keep it out of the cache.
+    time.sleep(1.5)
+    check("[flush] late refresh result is not resurrected after flush",
+          cache_view().get(flush_name) is None, json.dumps(cache_view()))
+    check("[flush] cancelled refresh is counted",
+          stats()["refreshes_cancelled"] >= 1, json.dumps(stats()))
+
+    # --- phase 2: reroute while a refresh is in flight --------------------
+    reroute_name = "reroutecheck.lab.example.com."
+    put_record(A_HTTP, reroute_name, {"kind": "A", "ttl": 10, "addresses": ["10.10.0.72"]})
+    put_record(B_HTTP, reroute_name, {"kind": "A", "ttl": 10, "addresses": ["10.20.0.72"]})
+    set_delay(A_HTTP, {reroute_name: 0.8})
+
+    dns_query(reroute_name, timeout=4)
+    reroute_entry = cache_view()[reroute_name]
+    check("[reroute] entry cached via A first", reroute_entry is not None)
+    time.sleep(8.2)  # enter the refresh window again
+    dns_query(reroute_name)
+    check("[reroute] refresh in flight before reroute",
+          wait_until(lambda: any(j["qname"] == reroute_name for j in refreshes_view())))
+
+    effect = rules_replace(f"127.0.0.1:{A_DNS}", [
+        {"suffix": "lab.example.com", "upstream": f"127.0.0.1:{B_DNS}"},
+    ])
+    check("[reroute] rule change evicts the entry and cancels its refresh",
+          effect["cache_evicted"] >= 1 and effect["refreshes_cancelled"] >= 1,
+          json.dumps(effect))
+    check("[reroute] entry gone after reroute", cache_view().get(reroute_name) is None)
+    check("[reroute] no refresh survives the reroute",
+          all(j["qname"] != reroute_name for j in refreshes_view()))
+
+    time.sleep(1.5)  # let A's late reply land on the closed socket
+    check("[reroute] A's late refresh result is not cached",
+          cache_view().get(reroute_name) is None, json.dumps(cache_view()))
+    reply = dns_query(reroute_name)  # normal miss -> B answers immediately
+    check("[reroute] next query is served by the new upstream B",
+          answer_addresses(reply) == ["10.20.0.72"], str(answer_addresses(reply)))
+    check("[reroute] cache entry now records B as its upstream",
+          cache_view()[reroute_name]["upstream"].endswith(str(B_DNS)))
+
+    set_delay(A_HTTP, {flush_name: 0.0, reroute_name: 0.0})
+
+
+def test_early_refresh_survives_neutral_rule_update() -> None:
+    print("\n[T8d] rule update that does not change the upstream keeps the refresh valid")
+    qname = "neutral.lab.example.com."
+    rules_replace(f"127.0.0.1:{A_DNS}", [
+        {"suffix": "lab.example.com", "upstream": f"127.0.0.1:{A_DNS}"},
+    ])
+    http("POST", f"http://127.0.0.1:{HTTP_PORT}/cache/flush")
+    http("POST", f"http://127.0.0.1:{A_HTTP}/counters/reset")
+    put_record(A_HTTP, qname, {"kind": "A", "ttl": 10, "addresses": ["10.10.0.61"]})
+    set_delay(A_HTTP, {qname: 0.8})
+
+    dns_query(qname, timeout=4)
+    entry_before = cache_view()[qname]
+    time.sleep(8.2)  # enter the refresh window while the 0.8s refresh is observable
+    dns_query(qname)  # schedules the refresh (A answers after 0.8s)
+    check("refresh scheduled via A",
+          wait_until(lambda: any(
+              j["qname"] == qname and j["upstream"].endswith(str(A_DNS))
+              for j in refreshes_view())))
+
+    # A neutral rewrite: the same selected upstream, expressed through an
+    # equivalent rule set with an extra suffix. Nothing may be evicted/cancelled.
+    effect = rules_replace(f"127.0.0.1:{A_DNS}", [
+        {"suffix": "example.com", "upstream": f"127.0.0.1:{A_DNS}"},
+        {"suffix": "lab.example.com", "upstream": f"127.0.0.1:{A_DNS}"},
+    ])
+    check("neutral rule update evicts nothing and cancels no refresh",
+          effect["cache_evicted"] == 0 and effect["refreshes_cancelled"] == 0,
+          json.dumps(effect))
+    check("the same entry identity is retained",
+          (e := cache_view().get(qname)) is not None
+          and e["entry_id"] == entry_before["entry_id"], json.dumps(cache_view()))
+    check("the refresh job keeps running against A",
+          any(j["qname"] == qname for j in refreshes_view()),
+          json.dumps(refreshes_view()))
+
+    replaced = wait_until(
+        lambda: (v := cache_view().get(qname)) is not None
+        and v["entry_id"] != entry_before["entry_id"] and v["ttl_remaining"] > 8.0,
+        timeout=4.0,
+    )
+    check("refresh still completes and replaces the entry after the rule update",
+          replaced, json.dumps(cache_view().get(qname)))
+    check("successful refresh counted", stats()["refreshes_succeeded"] >= 1)
+    set_delay(A_HTTP, {qname: 0.0})
+
+
 def main() -> int:
     procs = start_processes()
     try:
@@ -521,6 +810,10 @@ def main() -> int:
         test_servfail_on_upstream_failure()
         test_api_validation()
         test_interleaved_updates_and_queries()
+        test_early_refresh_concurrent_hits()
+        test_early_refresh_failure_keeps_expiry()
+        test_early_refresh_flush_and_reroute()
+        test_early_refresh_survives_neutral_rule_update()
     finally:
         stop_processes(procs)
 

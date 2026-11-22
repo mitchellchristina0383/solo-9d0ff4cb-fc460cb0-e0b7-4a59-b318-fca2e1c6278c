@@ -46,6 +46,9 @@ services:
       DNS_LISTEN_PORT: "5300"
       HTTP_PORT: "8080"
       UPSTREAM_TIMEOUT: "2"
+      # Positive A entries are refreshed in the background once their
+      # remaining TTL drops to this fraction of the original TTL.
+      REFRESH_TTL_RATIO: "0.2"
       DEFAULT_UPSTREAM: upstream-a:5353
       RULES_FILE: /app/config/initial-rules.json
     ports:

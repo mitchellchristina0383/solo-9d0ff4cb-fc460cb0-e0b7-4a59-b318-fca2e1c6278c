@@ -108,12 +108,16 @@ class RuleSet(BaseModel):
 
 
 class CacheEntryView(BaseModel):
+    entry_id: int
     qname: str
     qtype: str
     upstream: str
     rcode: str
     ttl_remaining: float
+    ttl_original: int
     expires_at: float
+    refresh_scheduled: bool
+    refresh_in_flight: bool
 
 
 class StatsView(BaseModel):
@@ -125,6 +129,12 @@ class StatsView(BaseModel):
     stale_replies_discarded: int
     servfail_responses: int
     upstream_timeouts: int = 0
+    refreshes_triggered: int = 0
+    refreshes_succeeded: int = 0
+    refreshes_failed: int = 0
+    refreshes_rejected: int = 0
+    refreshes_cancelled: int = 0
     in_flight: int
+    refreshes_in_flight: int
     cache_entries: int
     upstreams: dict[str, str]
