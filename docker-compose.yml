@@ -1,0 +1,61 @@
+# DNS forwarding lab: one forwarder + two delayable local upstreams.
+# All DNS traffic stays on the project's private network; host ports are only
+# published for the forwarder so clients can query 127.0.0.1:5300 and reach
+# the rule API at http://127.0.0.1:8080/docs.
+services:
+  upstream-a:
+    build: .
+    image: dns-lab:latest
+    command: python -m mock_upstream.server
+    environment:
+      UPSTREAM_ID: upstream-a
+      DNS_LISTEN_PORT: "5353"
+      HTTP_PORT: "8090"
+      ZONES_FILE: /app/mock_upstream/zones-a.json
+    ports:
+      - "127.0.0.1:8090:8090"
+    networks:
+      dnslab:
+        aliases:
+          - upstream-a
+
+  upstream-b:
+    build: .
+    image: dns-lab:latest
+    command: python -m mock_upstream.server
+    environment:
+      UPSTREAM_ID: upstream-b
+      DNS_LISTEN_PORT: "5353"
+      HTTP_PORT: "8091"
+      ZONES_FILE: /app/mock_upstream/zones-b.json
+    ports:
+      - "127.0.0.1:8091:8091"
+    networks:
+      dnslab:
+        aliases:
+          - upstream-b
+
+  forwarder:
+    build: .
+    image: dns-lab:latest
+    command: python -m dns_forwarder.main
+    depends_on:
+      - upstream-a
+      - upstream-b
+    environment:
+      DNS_LISTEN_PORT: "5300"
+      HTTP_PORT: "8080"
+      UPSTREAM_TIMEOUT: "2"
+      DEFAULT_UPSTREAM: upstream-a:5353
+      RULES_FILE: /app/config/initial-rules.json
+    ports:
+      - "127.0.0.1:5300:5300/udp"
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./config:/app/config:ro
+    networks:
+      - dnslab
+
+networks:
+  dnslab:
+    driver: bridge

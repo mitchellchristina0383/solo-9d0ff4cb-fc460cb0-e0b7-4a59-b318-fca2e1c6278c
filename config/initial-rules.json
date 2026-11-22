@@ -1,0 +1,8 @@
+{
+  "rules": [
+    {
+      "suffix": "lab.example.com",
+      "upstream": "upstream-a:5353"
+    }
+  ]
+}

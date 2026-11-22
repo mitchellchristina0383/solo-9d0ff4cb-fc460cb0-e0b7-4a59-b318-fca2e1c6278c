@@ -1,0 +1,8 @@
+{
+  "rules": [
+    {
+      "suffix": "lab.example.com",
+      "upstream": "127.0.0.1:15301"
+    }
+  ]
+}

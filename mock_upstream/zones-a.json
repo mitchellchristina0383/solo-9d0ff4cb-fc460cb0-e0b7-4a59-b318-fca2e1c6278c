@@ -1,0 +1,37 @@
+{
+  "default_delay": 0.0,
+  "records": {
+    "host1.lab.example.com": {
+      "kind": "A",
+      "ttl": 30,
+      "addresses": ["10.10.0.11"]
+    },
+    "host2.lab.example.com": {
+      "kind": "A",
+      "ttl": 45,
+      "addresses": ["10.10.0.12"]
+    },
+    "slow.lab.example.com": {
+      "kind": "A",
+      "ttl": 60,
+      "addresses": ["10.10.0.99"]
+    },
+    "gone.lab.example.com": {
+      "kind": "NXDOMAIN",
+      "zone": "lab.example.com",
+      "soa_ttl": 60,
+      "minimum": 20,
+      "include_soa": true
+    },
+    "no-soa.lab.example.com": {
+      "kind": "NXDOMAIN",
+      "zone": "lab.example.com",
+      "include_soa": false
+    },
+    "short.lab.example.com": {
+      "kind": "A",
+      "ttl": 2,
+      "addresses": ["10.10.0.77"]
+    }
+  }
+}
